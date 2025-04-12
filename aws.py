@@ -21,10 +21,7 @@ def create_default_config():
     default_config = {
         "global": {
             "round_time": 600,
-            "check_method": "remote",  # 可选: "local", "remote"
             "check_server_url": "http://8.130.42.117:5000/check",  # 远程检测服务地址
-            "check_attempts": 3,  # 本地检测尝试次数
-            "check_timeout": 3,  # 本地检测超时时间（秒）
             "proxy": ""
         },
         "servers": [
@@ -67,31 +64,6 @@ def load_config():
 
 # 检查服务器连接状态类
 class CheckConnection:
-    # 本地TCP连接检测
-    @staticmethod
-    def local_check(ip, port, timeout=3, attempts=3):
-        """
-        通过本地Socket尝试连接指定IP和端口
-        """
-        for attempt in range(1, attempts + 1):
-            try:
-                logger.debug(f"尝试 {attempt}/{attempts}")
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(timeout)
-                
-                result = sock.connect_ex((ip, port))
-                sock.close()
-                
-                if result == 0:
-                    logger.debug(f"成功连接到 {ip}:{port}")
-                    return True
-                else:
-                    logger.debug(f"无法连接到 {ip}:{port}")
-            except socket.error as e:
-                logger.debug(f"Socket错误: {e}")
-            time.sleep(1)  # 等待1秒再尝试
-        return False
-
     # 远程检测服务
     @staticmethod
     def remote_check(ip, port, check_server_url):
@@ -100,28 +72,21 @@ class CheckConnection:
         """
         try:
             url = check_server_url
-            params = {"ip": ip, "port": port}
+            # 使用server而不是ip作为参数名，以兼容自建服务
+            params = {"server": ip, "port": port}
             logger.debug(f"发送远程检测请求: {url} 参数: {params}")
             
             response = requests.get(url, params=params, timeout=10)
             if response.status_code == 200:
-                try:
-                    data = response.json()
-                    if data.get("status") == "success":
-                        return data.get("reachable", False)
-                    else:
-                        logger.error(f"远程检测服务返回错误: {data.get('message', '')}")
-                        return False
-                except ValueError:
-                    # 如果不是JSON格式，尝试解析纯文本响应
-                    text = response.text.strip().lower()
-                    if text == "true":
-                        return True
-                    elif text == "false":
-                        return False
-                    else:
-                        logger.error(f"无法解析远程检测服务响应: {response.text}")
-                        return False
+                # 尝试解析纯文本响应，预期是"True"或"False"
+                text = response.text.strip()
+                if text == "True":
+                    return True
+                elif text == "False":
+                    return False
+                else:
+                    logger.error(f"无法解析远程检测服务响应: {response.text}")
+                    return False
             else:
                 logger.error(f"远程检测服务返回状态码: {response.status_code}")
                 return False
@@ -236,11 +201,11 @@ def monitor_server(server_config, global_config):
         server_info = f"{aws.region}/{aws.aws_name}"
         logger.info(f"开始监控服务器: {server_info}")
         
-        # 检测方法配置
-        check_method = global_config.get("check_method", "local")
+        # 检测服务配置
         check_server_url = global_config.get("check_server_url", "")
-        check_timeout = global_config.get("check_timeout", 3)
-        check_attempts = global_config.get("check_attempts", 3)
+        if not check_server_url:
+            logger.error("未配置检测服务URL，请在配置中设置check_server_url")
+            return
         
         while True:
             try:
@@ -258,15 +223,8 @@ def monitor_server(server_config, global_config):
                 
                 # 检查连接状态
                 logger.info(f"检查服务器 {server_info} ({ip}:{aws.port}) 连接状态...")
-                
-                if check_method == "remote" and check_server_url:
-                    # 使用远程检测服务
-                    logger.info(f"使用远程检测服务: {check_server_url}")
-                    reachable = CheckConnection.remote_check(ip, aws.port, check_server_url)
-                else:
-                    # 使用本地检测
-                    logger.info("使用本地检测")
-                    reachable = CheckConnection.local_check(ip, aws.port, check_timeout, check_attempts)
+                logger.info(f"使用远程检测服务: {check_server_url}")
+                reachable = CheckConnection.remote_check(ip, aws.port, check_server_url)
                 
                 if reachable:
                     logger.info(f"服务器 {server_info} ({ip}:{aws.port}) 连接正常")
@@ -275,6 +233,15 @@ def monitor_server(server_config, global_config):
                     try:
                         old_ip, new_ip = aws.change_ip()
                         logger.info(f"服务器 {server_info} IP已更换: 旧IP: {old_ip} -> 新IP: {new_ip}")
+                        
+                        # 立即检测新IP是否可用
+                        logger.info(f"立即检测新IP {new_ip} 是否可用...")
+                        new_ip_reachable = CheckConnection.remote_check(new_ip, aws.port, check_server_url)
+                        
+                        if new_ip_reachable:
+                            logger.info(f"新IP {new_ip} 连接正常")
+                        else:
+                            logger.warning(f"新IP {new_ip} 连接仍然失败，将在下一轮尝试再次更换")
                     except Exception as e:
                         logger.error(f"服务器 {server_info} 更换IP失败: {str(e)}")
                 
